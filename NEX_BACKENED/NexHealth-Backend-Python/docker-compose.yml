@@ -1,0 +1,562 @@
+
+services:
+  # ── Infrastructure Services (Start First) ─────────────────────────────────
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: bionex-postgres
+    environment:
+      POSTGRES_DB: bionex
+      POSTGRES_USER: bionex
+      POSTGRES_PASSWORD: bionex
+      # Optimize for development
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      # Edge case: Use TCP check first, then pg_isready
+      test: 
+        - CMD-SHELL
+        - "pg_isready -U bionex -d bionex -h localhost || exit 1"
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 30s  # CRITICAL: Wait 30s before first health check
+    networks:
+      bionex-network:
+        aliases:
+          - postgres
+          - db
+          - database
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: bionex-redis
+    command: redis-server --appendonly yes --requirepass ""
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: 
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 20s  # CRITICAL: Wait 20s before first health check
+    networks:
+      bionex-network:
+        aliases:
+          - redis
+          - cache
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: bionex-vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: bionex-dev-root-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_API_ADDR: http://vault:8200
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test: 
+        - CMD
+        - vault
+        - status
+        - -address=http://127.0.0.1:8200
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 15s  # CRITICAL: Wait 15s before first health check
+    networks:
+      bionex-network:
+        aliases:
+          - vault
+          - secrets
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Microservices (Depend on Infrastructure) ──────────────────────────────
+  
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth_service/Dockerfile
+    container_name: bionex-auth-service
+    ports:
+      - "8001:8001"
+    environment:
+      # Database - use explicit hostname with retry timeout
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Security - MUST be provided via .env file or environment
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      # Development
+      DEBUG: "true"
+      # Connection pool settings for sqlalchemy
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - auth-service
+          - auth
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8001)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  patient-service:
+    build:
+      context: .
+      dockerfile: services/patient_service/Dockerfile
+    container_name: bionex-patient-service
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      DEBUG: "true"
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - patient-service
+          - patients
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8002)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  lab-service:
+    build:
+      context: .
+      dockerfile: services/lab_service/Dockerfile
+    container_name: bionex-lab-service
+    ports:
+      - "8003:8003"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      DEBUG: "true"
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - lab-service
+          - labs
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8003)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/payment_service/Dockerfile
+    container_name: bionex-payment-service
+    ports:
+      - "8004:8004"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      DEBUG: "true"
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - payment-service
+          - payments
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8004)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  crypto-service:
+    build:
+      context: .
+      dockerfile: services/crypto_service/Dockerfile
+    container_name: bionex-crypto-service
+    ports:
+      - "8005:8005"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      # Redis - required for nonce storage in registration challenge
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_TOKEN:-bionex-dev-root-token}
+      VAULT_NAMESPACE: bionex
+      DEBUG: "true"
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - crypto-service
+          - encryption
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8005)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  sharing-service:
+    build:
+      context: .
+      dockerfile: services/sharing_service/Dockerfile
+    container_name: bionex-sharing-service
+    ports:
+      - "8006:8006"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      DEBUG: "true"
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - sharing-service
+          - sharing
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8006)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  health-service:
+    build:
+      context: .
+      dockerfile: services/health_service/Dockerfile
+    container_name: bionex-health-service
+    ports:
+      - "8007:8007"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      DEBUG: "true"
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - health-service
+          - health
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8007)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nex-ai-service:
+    build:
+      context: .
+      dockerfile: services/nex_ai_service/Dockerfile
+    container_name: bionex-nex-ai-service
+    ports:
+      - "8008:8008"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      DEBUG: "true"
+      OPENAI_KEY: ${OPENAI_KEY:-}
+      SQLALCHEMY_POOL_SIZE: "20"
+      SQLALCHEMY_POOL_RECYCLE: "3600"
+      SQLALCHEMY_POOL_PRE_PING: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - nex-ai-service
+          - nex
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8008)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── API Gateway (Depends on all services) ─────────────────────────────────
+  
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: bionex-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://bionex:bionex@postgres:5432/bionex?connect_timeout=10
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?error SECRET_KEY must be set in .env file}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?error FIELD_ENCRYPTION_KEY must be set in .env file}
+      # Service URLs - use internal Docker network hostnames
+      AUTH_SERVICE_URL: http://auth-service:8001
+      PATIENT_SERVICE_URL: http://patient-service:8002
+      LAB_SERVICE_URL: http://lab-service:8003
+      PAYMENT_SERVICE_URL: http://payment-service:8004
+      CRYPTO_SERVICE_URL: http://crypto-service:8005
+      SHARING_SERVICE_URL: http://sharing-service:8006
+      HEALTH_SERVICE_URL: http://health-service:8007
+      NEX_AI_SERVICE_URL: http://nex-ai-service:8008
+      DEBUG: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      patient-service:
+        condition: service_healthy
+      lab-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      crypto-service:
+        condition: service_healthy
+      sharing-service:
+        condition: service_healthy
+      health-service:
+        condition: service_healthy
+      nex-ai-service:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - gateway
+          - api
+    healthcheck:
+      test: 
+        - CMD-SHELL
+        - "python -c \"import socket; s = socket.socket(); s.connect(('localhost', 8000)); s.close()\" || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Optional Tools (profiles: tools) ──────────────────────────────────────
+  
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: bionex-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@bionex.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - pgadmin
+    restart: unless-stopped
+    profiles:
+      - tools
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: bionex-redis-commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      bionex-network:
+        aliases:
+          - redis-commander
+    restart: unless-stopped
+    profiles:
+      - tools
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ── Volumes (Persist data) ────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ── Networks (Docker service discovery) ───────────────────────────────────
+networks:
+  bionex-network:
+    driver: bridge
+    driver_opts:
+      # Enable IPv6 for better network isolation (optional)
+      com.docker.network.driver.mtu: 1500
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

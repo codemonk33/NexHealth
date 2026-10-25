@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Bionex",
+    "slug": "bionex",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#4EBAA1"
+    },
+    "plugins": [
+      "expo-font",
+      "expo-camera",
+      "expo-image-picker",
+      "expo-document-picker",
+      "expo-secure-store"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.bionex.health",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Bionex needs camera access to scan medical documents.",
+        "NSPhotoLibraryUsageDescription": "Bionex needs photo library access to upload medical records.",
+        "NSHealthShareUsageDescription": "Bionex needs HealthKit access to sync your health data."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#4EBAA1",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "package": "com.bionex.health",
+      "permissions": [
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "ACTIVITY_RECOGNITION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}

@@ -1,0 +1,513 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from jose import JWTError
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.database import get_db
+from app.dependencies import get_current_user
+from app.models.patient import Patient
+from app.models.user import User, UserRole
+from app.schemas.user import (
+    ChangePasswordRequest,
+    TwoFASetupRequest,
+    TwoFAVerifyRequest,
+    TokenRefresh,
+    TokenResponse,
+    UserCreate,
+    UserLogin,
+    UserOut,
+)
+from app.services.audit_service import log_event
+from app.services.auth_service import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    hash_password,
+    verify_password,
+)
+from app.services.mfa_service import (
+    generate_backup_codes,
+    generate_totp_secret,
+    verify_backup_code,
+    verify_totp_token,
+)
+from app.services.security_service import (
+    is_account_locked,
+    is_password_reused,
+    record_failed_login,
+    record_password_change,
+    record_successful_login,
+    unlock_account,
+    validate_password_strength,
+    invalidate_all_user_sessions,
+)
+
+router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
+settings = get_settings()
+
+
+@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+@limiter.limit("3/minute")
+def register(request: Request, payload: UserCreate, db: Session = Depends(get_db)):
+    """Register a new user. Rate limited to 5/minute."""
+    import logging
+    import time
+    logger = logging.getLogger(__name__)
+    
+    from sqlalchemy import or_
+
+    try:
+        # P0-2: Timing mitigation to prevent account enumeration
+        registration_start = time.time()
+        
+        conditions = [User.phone == payload.phone]
+        if payload.email is not None:
+            conditions.append(User.email == payload.email)
+
+        existing = db.query(User).filter(or_(*conditions)).first()
+        if existing:
+            logger.warning(f"Registration attempt for existing account: {payload.phone}")
+            # P0-2: Return generic success response to prevent account enumeration
+            # Add timing delay to match successful registration timing
+            elapsed = time.time() - registration_start
+            delay_needed = __import__("random").uniform(0.1, 0.3)
+            if elapsed < delay_needed:
+                time.sleep(delay_needed - elapsed)
+            # Return 201 with generic message (appears as successful registration)
+            return {"id": "", "phone": "", "email": "", "name": "", "role": ""}
+
+        user = User(
+            name=payload.name,
+            phone=payload.phone,
+            email=payload.email,
+            hashed_password=hash_password(payload.password),
+            role=payload.role,
+        )
+        db.add(user)
+        db.flush()
+
+        # Create patient profile if registering as patient (Phase 2: Transaction handling)
+        if user.role == UserRole.PATIENT:
+            db.add(Patient(user_id=user.id))
+
+        db.commit()
+        db.refresh(user)
+        logger.info(f"User registered successfully: {user.id} - {user.phone}")
+        
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Registration error for {payload.phone}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Registration failed: {str(e)}",
+        )
+
+    ip = request.client.host if request.client else None
+    try:
+        log_event(db, "REGISTER", "User", str(user.id), user.id, ip_address=ip)
+    except Exception as e:
+        logger.error(f"Failed to log register event: {str(e)}")
+    
+    return user
+
+
+@router.post("/login", response_model=TokenResponse)
+@limiter.limit("10/minute")
+def login(request: Request, payload: UserLogin, db: Session = Depends(get_db)):
+    """
+    Login endpoint with account lockout after failed attempts (Enhanced Security #1).
+    Returns requires_2fa=true if 2FA is enabled.
+    P0-2: Account enumeration mitigations applied.
+    """
+    import logging
+    import time
+    logger = logging.getLogger(__name__)
+    
+    ip_address = request.client.host if request.client else None
+    login_start = time.time()
+
+    try:
+        user = db.query(User).filter(User.phone == payload.phone, User.is_active).first()
+
+        # Check if account is locked (Enhanced Security #1)
+        # P0-2: Use generic 401 instead of 429 to prevent account enumeration
+        if user and is_account_locked(user):
+            logger.warning(f"Login attempt on locked account: {payload.phone}")
+            # Add timing delay to match failed login timing
+            elapsed = time.time() - login_start
+            delay_needed = __import__("random").uniform(0.1, 0.3)
+            if elapsed < delay_needed:
+                time.sleep(delay_needed - elapsed)
+            # Return generic 401 instead of 429 to prevent revealing account exists or is locked
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+            )
+
+        # Verify credentials
+        if not user or not verify_password(payload.password, user.hashed_password):
+            if user:
+                logger.warning(f"Failed login attempt for user: {payload.phone}")
+                record_failed_login(db, str(user.id), payload.phone, ip_address)
+                # Refresh user from DB to get updated is_locked status
+                db.refresh(user)
+                if is_account_locked(user):
+                    logger.error(f"Account locked after failed login: {payload.phone}")
+                    # P0-2: Add timing delay
+                    elapsed = time.time() - login_start
+                    delay_needed = __import__("random").uniform(0.1, 0.3)
+                    if elapsed < delay_needed:
+                        time.sleep(delay_needed - elapsed)
+                    # Return generic 401 instead of 429
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid credentials",
+                    )
+            else:
+                logger.warning(f"Login attempt for non-existent user: {payload.phone}")
+                record_failed_login(db, None, payload.phone, ip_address)
+                # P0-2: Add timing delay even for non-existent user to prevent enumeration
+                elapsed = time.time() - login_start
+                delay_needed = __import__("random").uniform(0.1, 0.3)
+                if elapsed < delay_needed:
+                    time.sleep(delay_needed - elapsed)
+
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+            )
+
+        # Record successful login and reset attempts
+        record_successful_login(db, str(user.id), ip_address)
+        logger.info(f"Successful login for user: {user.phone}")
+
+        access_token = create_access_token({"sub": str(user.id), "role": user.role})
+        refresh_token = create_refresh_token({"sub": str(user.id)})
+
+        try:
+            log_event(db, "LOGIN", "User", str(user.id), user.id, ip_address=ip_address)
+        except Exception as e:
+            logger.error(f"Failed to log login event: {str(e)}")
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "role": user.role,
+            "requires_2fa": user.is_2fa_enabled,  # Enhanced Security #2
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Login failed: {str(e)}",
+        )
+
+
+@router.post("/refresh", response_model=TokenResponse)
+def refresh(payload: TokenRefresh, request: Request, db: Session = Depends(get_db)):
+    """Refresh access token using refresh token."""
+    try:
+        data = decode_token(payload.refresh_token)
+        if data.get("type") != "refresh":
+            raise JWTError()
+        user_id = data.get("sub")
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        )
+
+    user = db.query(User).filter(User.id == user_id, User.is_active).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account not found or inactive",
+        )
+
+    access_token = create_access_token({"sub": str(user.id), "role": user.role})
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+
+    ip = request.client.host if request.client else None
+    log_event(db, "REFRESH_TOKEN", "User", str(user.id), user.id, ip_address=ip)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "role": user.role,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 & Enhanced Security Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+@limiter.limit("5/minute")
+def change_password(
+    request: Request,
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Change user password (Phase 2 Security).
+    Validates old password, enforces strong new password, prevents reuse.
+    Invalidates all active sessions on successful change.
+    """
+    # Verify old password
+    if not verify_password(payload.old_password, current_user.hashed_password):
+        ip = request.client.host if request.client else None
+        log_event(
+            db,
+            "PASSWORD_CHANGE_FAILED",
+            "User",
+            str(current_user.id),
+            current_user.id,
+            ip_address=ip,
+            reason="Invalid old password",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid current password",
+        )
+
+    # Validate new password strength (Enhanced Security #3)
+    is_strong, error_msg = validate_password_strength(payload.new_password)
+    if not is_strong:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg)
+
+    # Check if password was reused (Enhanced Security #3)
+    hashed_new = hash_password(payload.new_password)
+    if is_password_reused(db, str(current_user.id), hashed_new):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot reuse last 5 passwords",
+        )
+
+    # Record old password in history (Enhanced Security #3)
+    record_password_change(db, str(current_user.id), current_user.hashed_password)
+
+    # Update password and mark as changed
+    current_user.hashed_password = hashed_new
+    current_user.last_password_change = datetime.now(timezone.utc)
+    current_user.password_expires_at = datetime.now(timezone.utc) + __import__(
+        "datetime"
+    ).timedelta(days=90)
+    db.commit()
+
+    # Invalidate all sessions (Enhanced Security #7)
+    invalidate_all_user_sessions(db, str(current_user.id))
+
+    ip = request.client.host if request.client else None
+    log_event(
+        db,
+        "PASSWORD_CHANGED",
+        "User",
+        str(current_user.id),
+        current_user.id,
+        ip_address=ip,
+    )
+
+    return {"message": "Password changed successfully. Please login again."}
+
+
+@router.post("/2fa/setup", status_code=status.HTTP_200_OK)
+@limiter.limit("5/minute")
+def setup_2fa(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Generate TOTP secret for 2FA setup (Enhanced Security #2).
+    Returns secret and provisioning_uri for QR code generation.
+    User must verify with /2fa/setup/verify before enabling.
+    """
+    from app.models.login_attempt import TOTPSecret
+
+    # Generate new secret
+    secret, provisioning_uri = generate_totp_secret()
+    backup_codes = generate_backup_codes()
+
+    # Store unverified secret
+    totp_record = TOTPSecret(
+        user_id=current_user.id,
+        secret=secret,
+        backup_codes=__import__("json").dumps(backup_codes),
+        is_verified=False,
+    )
+    db.add(totp_record)
+    db.commit()
+
+    return {
+        "secret": secret,
+        "provisioning_uri": provisioning_uri,
+        "backup_codes": backup_codes,
+        "message": "Scan the QR code or enter the secret in your authenticator app. Verify with /2fa/setup/verify before enabling.",
+    }
+
+
+@router.post("/2fa/setup/verify", status_code=status.HTTP_200_OK)
+@limiter.limit("5/minute")
+def verify_2fa_setup(
+    request: Request,
+    payload: TwoFASetupRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Verify 2FA setup by validating TOTP token. Enables 2FA on success."""
+    from app.models.login_attempt import TOTPSecret
+
+    totp_record = (
+        db.query(TOTPSecret)
+        .filter(
+            TOTPSecret.user_id == current_user.id,
+            TOTPSecret.is_verified == False,
+        )
+        .first()
+    )
+
+    if not totp_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No pending 2FA setup found",
+        )
+
+    # Verify TOTP token
+    if not verify_totp_token(totp_record.secret, payload.token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid TOTP token",
+        )
+
+    # Mark as verified and enable 2FA
+    totp_record.is_verified = True
+    totp_record.verified_at = datetime.now(timezone.utc)
+    current_user.is_2fa_enabled = True
+    db.commit()
+
+    log_event(db, "2FA_ENABLED", "User", str(current_user.id), current_user.id)
+
+    return {
+        "message": "2FA enabled successfully",
+        "remaining_backup_codes": len(
+            __import__("json").loads(totp_record.backup_codes)
+        ),
+    }
+
+
+@router.post("/2fa/disable", status_code=status.HTTP_200_OK)
+@limiter.limit("5/minute")
+def disable_2fa(
+    request: Request,
+    payload: TwoFAVerifyRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Disable 2FA by verifying current TOTP or backup code."""
+    from app.models.login_attempt import TOTPSecret
+
+    if not current_user.is_2fa_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="2FA is not enabled",
+        )
+
+    totp_record = (
+        db.query(TOTPSecret)
+        .filter(
+            TOTPSecret.user_id == current_user.id,
+            TOTPSecret.is_verified,
+        )
+        .first()
+    )
+
+    if not totp_record:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="2FA record not found",
+        )
+
+    # Try TOTP token first
+    if verify_totp_token(totp_record.secret, payload.token):
+        current_user.is_2fa_enabled = False
+        db.delete(totp_record)
+        db.commit()
+        log_event(db, "2FA_DISABLED", "User", str(current_user.id), current_user.id)
+        return {"message": "2FA disabled successfully"}
+
+    # Try backup code
+    is_valid, updated_codes = verify_backup_code(
+        totp_record.backup_codes, payload.token
+    )
+    if is_valid:
+        if updated_codes == "[]":  # Last backup code used
+            current_user.is_2fa_enabled = False
+            db.delete(totp_record)
+        else:
+            totp_record.backup_codes = updated_codes
+        db.commit()
+        log_event(
+            db, "2FA_DISABLED_VIA_BACKUP", "User", str(current_user.id), current_user.id
+        )
+        return {"message": "2FA disabled successfully using backup code"}
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid TOTP token or backup code",
+    )
+
+
+@router.post("/unlock-account", status_code=status.HTTP_200_OK)
+@limiter.limit("3/minute")
+def unlock_account_admin(
+    request: Request,
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Unlock a locked account (Enhanced Security #1).
+    Only admins can unlock accounts.
+    """
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can unlock accounts",
+        )
+
+    import uuid
+
+    try:
+        uid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user ID format"
+        )
+
+    user = db.query(User).filter(User.id == uid).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    unlock_account(db, user)
+    log_event(db, "ACCOUNT_UNLOCKED", "User", str(user.id), current_user.id)
+
+    return {"message": f"User {user.phone} unlocked successfully"}
